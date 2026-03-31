@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Motion Capture Particles</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; font-family: 'Segoe UI', sans-serif; color: #fff; }
+
+    #videoEl {
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+      opacity: 0.1;
+      pointer-events: none;
+      z-index: 1;
+    }
+    #canvas {
+      position: fixed; top: 0; left: 0;
+      width: 100%; height: 100%;
+      z-index: 2;
+    }
+    #ui {
+      position: fixed; top: 20px; left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      display: flex; gap: 10px; align-items: center;
+      background: rgba(0,0,0,0.55);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 50px;
+      padding: 10px 20px;
+      backdrop-filter: blur(10px);
+      white-space: nowrap;
+    }
+    #ui button {
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.2);
+      color: #fff; padding: 6px 16px; border-radius: 20px;
+      cursor: pointer; font-size: 13px; transition: all 0.2s;
+    }
+    #ui button:hover { background: rgba(255,255,255,0.22); }
+    #ui button.active { background: rgba(120,80,255,0.6); border-color: rgba(180,140,255,0.5); }
+    #status { font-size: 12px; opacity: 0.6; min-width: 140px; text-align: center; }
+    #modeLabel { font-size: 12px; opacity: 0.5; letter-spacing: 1px; text-transform: uppercase; }
+    .sep { width: 1px; height: 20px; background: rgba(255,255,255,0.15); }
+    #hint {
+      position: fixed; bottom: 24px; left: 50%;
+      transform: translateX(-50%);
+      z-index: 10; font-size: 12px; opacity: 0.3; letter-spacing: 0.5px;
+    }
+  </style>
+</head>
+<body>
+
+<video id="videoEl" autoplay muted playsinline></video>
+<canvas id="canvas"></canvas>
+
+<div id="ui">
+  <span id="modeLabel">Mode</span>
+  <div class="sep"></div>
+  <button id="btnCosmos" class="active" onclick="setMode('cosmos')">Cosmos</button>
+  <button id="btnFire"   onclick="setMode('fire')">Fire</button>
+  <button id="btnMatrix" onclick="setMode('matrix')">Matrix</button>
+  <button id="btnNeon"   onclick="setMode('neon')">Neon</button>
+  <div class="sep"></div>
+  <button onclick="toggleCam()" id="camBtn">Cam: Dim</button>
+  <div class="sep"></div>
+  <span id="status">Loading model...</span>
+</div>
+<div id="hint">Stand in frame · Move your body · Particles follow your silhouette</div>
+
+<!-- MediaPipe Pose + Camera utils -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+//  CANVAS & GLOBALS
+// ═══════════════════════════════════════════════════════════
+const canvas  = document.getElementById('canvas');
+const ctx     = canvas.getContext('2d');
+const videoEl = document.getElementById('videoEl');
+const statusEl = document.getElementById('status');
+
+let W, H;
+function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
+window.addEventListener('resize', resize);
+resize();
+
+let mode = 'cosmos';
+
+// Live body state — written by MediaPipe callback, read by render loop
+let bodyPts   = [];          // { x, y, hue, speed } in screen pixels
+let lmRaw     = null;        // last raw 33 landmarks
+let prevLmRaw = null;
+let lmSpeeds  = new Float32Array(33);
+
+// ═══════════════════════════════════════════════════════════
+//  SEGMENTATION MASK  (gives full body silhouette)
+// ═══════════════════════════════════════════════════════════
+const MASK_W = 96, MASK_H = 54;
+const maskCv  = document.createElement('canvas');
+maskCv.width  = MASK_W; maskCv.height = MASK_H;
+const maskCtx = maskCv.getContext('2d', { willReadFrequently: true });
+
+let bodyPixIdx  = new Int32Array(MASK_W * MASK_H);
+let bodyPixN    = 0;
+let hasMask     = false;
+
+function updateMask(seg) {
+  try {
+    // Mirror the mask to match the flipped display
+    maskCtx.save();
+    maskCtx.translate(MASK_W, 0);
+    maskCtx.scale(-1, 1);
+    maskCtx.drawImage(seg, 0, 0, MASK_W, MASK_H);
+    maskCtx.restore();
+
+    const d = maskCtx.getImageData(0, 0, MASK_W, MASK_H).data;
+    bodyPixN = 0;
+    for (let i = 0, n = MASK_W * MASK_H; i < n; i++) {
+      // Red channel > threshold = person pixel
+      if (d[i * 4] > 40) bodyPixIdx[bodyPixN++] = i;
+    }
+    hasMask = bodyPixN > 20;
+  } catch { hasMask = false; }
+}
+
+// Return a random point sampled from the body silhouette (screen coords)
+function maskSample() {
+  if (!hasMask) return null;
+  const flat = bodyPixIdx[Math.floor(Math.random() * bodyPixN)];
+  return {
+    x: ((flat % MASK_W) / MASK_W) * W,
+    y: (Math.floor(flat / MASK_W) / MASK_H) * H,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════
+//  BODY POINTS from 33 landmarks + bone interpolation
+// ═══════════════════════════════════════════════════════════
+const BONES = [
+  [11,12],[11,13],[13,15],[15,17],[15,19],[17,19],
+  [12,14],[14,16],[16,18],[16,20],[18,20],
+  [11,23],[12,24],[23,24],
+  [23,25],[24,26],[25,27],[26,28],
+  [27,29],[28,30],[29,31],[30,32],
+  [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
+];
+
+function lmHue(i) {
+  if (i <= 10) return 200;  // face — cool blue
+  if (i <= 12) return 270;  // shoulders — purple
+  if (i <= 16) return 310;  // elbows — pink
+  if (i <= 22) return 180;  // wrists/hands — cyan
+  if (i <= 24) return 130;  // hips — green
+  return 45;                // legs/feet — gold
+}
+
+function buildBodyPoints(lms) {
+  if (!lms) { bodyPts = []; return; }
+  const pts = [];
+  const VIS = 0.25;
+
+  for (let i = 0; i < lms.length; i++) {
+    const l = lms[i];
+    if ((l.visibility ?? 1) < VIS) continue;
+    pts.push({ x: (1 - l.x) * W, y: l.y * H, hue: lmHue(i), speed: lmSpeeds[i] });
+  }
+
+  for (const [a, b] of BONES) {
+    const la = lms[a], lb = lms[b];
+    if (!la || !lb || (la.visibility ?? 1) < VIS || (lb.visibility ?? 1) < VIS) continue;
+    for (const t of [0.25, 0.5, 0.75]) {
+      pts.push({
+        x: (1 - (la.x + (lb.x - la.x) * t)) * W,
+        y:     (la.y + (lb.y - la.y) * t)  * H,
+        hue: (lmHue(a) + lmHue(b)) / 2,
+        speed: (lmSpeeds[a] + lmSpeeds[b]) / 2,
+      });
+    }
+  }
+  bodyPts = pts;
+}
+
+function calcSpeeds(lms) {
+  if (!prevLmRaw || !lms) { prevLmRaw = lms; return; }
+  for (let i = 0; i < 33; i++) {
+    const c = lms[i], p = prevLmRaw[i];
+    if (!c || !p) continue;
+    const dx = (c.x - p.x) * W, dy = (c.y - p.y) * H;
+    lmSpeeds[i] = Math.sqrt(dx * dx + dy * dy);
+  }
+  prevLmRaw = lms;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  MODE CONFIGS
+// ═══════════════════════════════════════════════════════════
+const MODES = {
+  cosmos: { bg: 'rgba(0,0,4,0.18)',   gravity: 0,     col: (h,a) => `hsla(${h},85%,74%,${a})`  },
+  fire:   { bg: 'rgba(5,1,0,0.22)',   gravity:-0.09,  col: (h,a) => `hsla(${h%55+3},95%,65%,${a})` },
+  matrix: { bg: 'rgba(0,5,2,0.24)',   gravity: 0.05,  col: (h,a) => `hsla(${120+h%35},90%,58%,${a})` },
+  neon:   { bg: 'rgba(2,0,7,0.18)',   gravity: 0,     col: (h,a) => `hsla(${h},100%,70%,${a})` },
+};
+const cfg = () => MODES[mode];
+
+// ═══════════════════════════════════════════════════════════
+//  PARTICLE
+// ═══════════════════════════════════════════════════════════
+const BODY_N    = 1400;  // spring to body silhouette
+const AMBIENT_N =  400;  // atmosphere / background glow
+
+class Particle {
+  constructor(isBody) {
+    this.isBody = isBody;
+    this.x  = Math.random() * W;
+    this.y  = Math.random() * H;
+    this.vx = (Math.random() - 0.5) * 2;
+    this.vy = (Math.random() - 0.5) * 2;
+    this.hue  = Math.random() * 360;
+    this.sat  = 75 + Math.random() * 25;
+    this.alpha = Math.random() * (isBody ? 0.3 : 0.5);
+    this.size  = isBody ? 1.0 + Math.random() * 1.6 : 0.8 + Math.random() * 2.2;
+
+    // Home tracking (body particles)
+    this.homeX = -1; this.homeY = -1; this.homeHue = 200;
+    this.homeTick = Math.floor(Math.random() * 60);
+    this.homeLife = 30 + Math.floor(Math.random() * 90);
+  }
+
+  update() {
+    if (this.isBody) this._updateBody();
+    else             this._updateAmbient();
+
+    this.x += this.vx;
+    this.y += this.vy;
+
+    // Wrap edges
+    if (this.x < -20) this.x = W + 20;
+    else if (this.x > W + 20) this.x = -20;
+    if (this.y < -20) this.y = H + 20;
+    else if (this.y > H + 20) this.y = -20;
+  }
+
+  _updateBody() {
+    // ── Refresh home point from body mask or skeleton ─────────────────
+    this.homeTick--;
+    if (this.homeTick <= 0 || this.homeX < 0) {
+      let pt = null;
+
+      if (hasMask && Math.random() < 0.82) {
+        // Prefer mask sample — covers full silhouette (face, torso, limbs)
+        pt = maskSample();
+      }
+      if (!pt && bodyPts.length > 0) {
+        // Fallback to skeleton point
+        pt = bodyPts[Math.floor(Math.random() * bodyPts.length)];
+      }
+
+      if (pt) {
+        this.homeX   = pt.x;
+        this.homeY   = pt.y;
+        this.homeHue = pt.hue ?? this.homeHue;
+      }
+      this.homeTick = this.homeLife;
+    }
+
+    // ── Spring toward home ────────────────────────────────────────────
+    if (this.homeX >= 0) {
+      const dx = this.homeX - this.x;
+      const dy = this.homeY - this.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) + 0.1;
+
+      // Elastic pull: proportional to distance, capped
+      const pull = Math.min(dist * 0.20, 11) * 0.13;
+      this.vx += (dx / dist) * pull;
+      this.vy += (dy / dist) * pull;
+
+      this.hue += (this.homeHue - this.hue) * 0.05;
+    }
+
+    // Strong damping — keeps particles tight on body
+    this.vx *= 0.78;
+    this.vy *= 0.78;
+
+    // Micro-turbulence for organic feel
+    this.vx += (Math.random() - 0.5) * 0.3;
+    this.vy += (Math.random() - 0.5) * 0.3;
+
+    // ── Burst outward from fast-moving joints ─────────────────────────
+    for (const bp of bodyPts) {
+      if (bp.speed < 16) continue;
+      const dx = this.x - bp.x, dy = this.y - bp.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > 65 * 65) continue;
+      const d = Math.sqrt(d2) + 0.1;
+      const burst = bp.speed * 0.07;
+      this.vx += (dx / d) * burst;
+      this.vy += (dy / d) * burst;
+    }
+
+    // Fade in when body present, fade out when not
+    this.alpha = bodyPts.length > 0
+      ? Math.min(0.92, this.alpha + 0.05)
+      : Math.max(0,    this.alpha - 0.025);
+  }
+
+  _updateAmbient() {
+    // ── Gentle attraction toward nearest body point ───────────────────
+    let attracted = false;
+    if (bodyPts.length > 0) {
+      let minD2 = 230 * 230, nearest = null;
+      for (const bp of bodyPts) {
+        const dx = bp.x - this.x, dy = bp.y - this.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < minD2) { minD2 = d2; nearest = bp; }
+      }
+      if (nearest) {
+        const d = Math.sqrt(minD2);
+        this.vx += (nearest.x - this.x) / d * 0.55;
+        this.vy += (nearest.y - this.y) / d * 0.55;
+        this.hue += (nearest.hue - this.hue) * 0.012;
+        attracted = true;
+      }
+    }
+
+    const c = cfg();
+    this.vx *= 0.965;
+    this.vy *= 0.965;
+    this.vy += c.gravity;
+    this.vx += (Math.random() - 0.5) * 0.22;
+    this.vy += (Math.random() - 0.5) * 0.22;
+
+    this.alpha = attracted
+      ? Math.min(0.60, this.alpha + 0.012)
+      : Math.max(0.04, this.alpha - 0.004);
+  }
+
+  draw() {
+    const r = this.size * (this.isBody ? 2.0 : 3.2);
+    const col = cfg().col;
+    const grd = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, r);
+    grd.addColorStop(0, col(this.hue, this.alpha));
+    grd.addColorStop(1, col(this.hue, 0));
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = grd;
+    ctx.fill();
+  }
+}
+
+const particles = [
+  ...Array.from({ length: BODY_N    }, () => new Particle(true)),
+  ...Array.from({ length: AMBIENT_N }, () => new Particle(false)),
+];
+
+// ═══════════════════════════════════════════════════════════
+//  SKELETON OVERLAY
+// ═══════════════════════════════════════════════════════════
+const SKEL_PAIRS = [
+  [11,12],[11,13],[13,15],[15,17],[12,14],[14,16],
+  [11,23],[12,24],[23,24],
+  [23,25],[24,26],[25,27],[26,28],
+  [27,29],[28,30],[29,31],[30,32],
+];
+
+function drawSkeleton() {
+  if (!lmRaw) return;
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  const VIS = 0.35;
+
+  for (const [a, b] of SKEL_PAIRS) {
+    const la = lmRaw[a], lb = lmRaw[b];
+    if (!la || !lb || (la.visibility ?? 1) < VIS || (lb.visibility ?? 1) < VIS) continue;
+    const ax = (1 - la.x) * W, ay = la.y * H;
+    const bx = (1 - lb.x) * W, by = lb.y * H;
+    const spd = (lmSpeeds[a] + lmSpeeds[b]) * 0.5;
+    ctx.beginPath();
+    ctx.moveTo(ax, ay); ctx.lineTo(bx, by);
+    ctx.strokeStyle = `hsla(${(lmHue(a) + lmHue(b)) / 2},80%,70%,${Math.min(0.45, 0.12 + spd * 0.012)})`;
+    ctx.lineWidth = 1.2 + spd * 0.04;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+  }
+
+  for (let i = 0; i < lmRaw.length; i++) {
+    const l = lmRaw[i];
+    if ((l.visibility ?? 1) < VIS) continue;
+    const x = (1 - l.x) * W, y = l.y * H;
+    const spd = lmSpeeds[i], r = 2.5 + spd * 0.1;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r * 3.5);
+    g.addColorStop(0, `hsla(${lmHue(i)},100%,92%,0.75)`);
+    g.addColorStop(1, `hsla(${lmHue(i)},100%,60%,0)`);
+    ctx.beginPath();
+    ctx.arc(x, y, r * 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = g;
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ═══════════════════════════════════════════════════════════
+//  RENDER LOOP  (60 fps, never awaits)
+// ═══════════════════════════════════════════════════════════
+function renderLoop() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = cfg().bg;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.globalCompositeOperation = 'screen';
+  for (const p of particles) { p.update(); p.draw(); }
+
+  drawSkeleton();
+  requestAnimationFrame(renderLoop);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  MEDIAPIPE POSE SETUP
+// ═══════════════════════════════════════════════════════════
+const mpPose = new Pose({
+  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`
+});
+
+mpPose.setOptions({
+  modelComplexity: 1,       // 0=fast, 1=balanced, 2=most accurate
+  smoothLandmarks:    true,
+  enableSegmentation: true, // ← gives us the body silhouette mask
+  smoothSegmentation: true,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence:  0.5,
+});
+
+mpPose.onResults(results => {
+  if (results.segmentationMask) updateMask(results.segmentationMask);
+
+  if (results.poseLandmarks) {
+    calcSpeeds(results.poseLandmarks);
+    buildBodyPoints(results.poseLandmarks);
+    lmRaw = results.poseLandmarks;
+    statusEl.textContent = 'Tracking';
+  } else {
+    bodyPts = []; lmRaw = null;
+    statusEl.textContent = 'No person detected';
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  CAMERA  (MediaPipe drives the video element)
+// ═══════════════════════════════════════════════════════════
+const mpCamera = new Camera(videoEl, {
+  onFrame: async () => { await mpPose.send({ image: videoEl }); },
+  width: 640, height: 480,
+});
+
+// ═══════════════════════════════════════════════════════════
+//  BOOT
+// ═══════════════════════════════════════════════════════════
+(async () => {
+  try {
+    statusEl.textContent = 'Loading model...';
+    await mpPose.initialize();
+    statusEl.textContent = 'Starting camera...';
+    await mpCamera.start();
+    statusEl.textContent = 'Tracking';
+  } catch (e) {
+    statusEl.textContent = '⚠ ' + (e.message || 'Init error');
+    console.error(e);
+  }
+  renderLoop(); // always start rendering
+})();
+
+// ═══════════════════════════════════════════════════════════
+//  UI CONTROLS
+// ═══════════════════════════════════════════════════════════
+function setMode(m) {
+  mode = m;
+  ['cosmos','fire','matrix','neon'].forEach(n =>
+    document.getElementById('btn' + n[0].toUpperCase() + n.slice(1))
+      .classList.toggle('active', n === m)
+  );
+  for (const p of particles) {
+    if (!p.isBody) {
+      if (m === 'fire')   p.hue = Math.random() * 55;
+      if (m === 'matrix') p.hue = 105 + Math.random() * 50;
+    }
+  }
+}
+
+const CAM_LEVELS = [0.10, 0.0, 0.28];
+const CAM_LABELS = ['Dim','Off','Bright'];
+let camIdx = 0;
+function toggleCam() {
+  camIdx = (camIdx + 1) % 3;
+  videoEl.style.opacity = CAM_LEVELS[camIdx];
+  document.getElementById('camBtn').textContent = 'Cam: ' + CAM_LABELS[camIdx];
+}
+</script>
+</body>
+</html>
