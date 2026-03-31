@@ -132,8 +132,8 @@ class Particle {
   }
 
   _updateBody(
-    W: number,
-    H: number,
+    _W: number,
+    _H: number,
     bodyPts: BodyPoint[],
     hasMask: boolean,
     maskSample: () => { x: number; y: number } | null
@@ -294,6 +294,8 @@ export default function MotionParticles() {
     function updateMask(seg: CanvasImageSource) {
       try {
         const maskCtx = maskCtxRef.current!;
+        // Clear old mask data so ghost pixels don't persist at previous body positions
+        maskCtx.clearRect(0, 0, MASK_W, MASK_H);
         maskCtx.save();
         maskCtx.translate(MASK_W, 0);
         maskCtx.scale(-1, 1);
